@@ -1,0 +1,255 @@
+Scotty - Prediction - Achmad Nafila Rozie
+
+
+```{r}
+#install the libraries that potentially required
+library(flexdashboard)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(data.table)
+library(plotly)
+library(glue)
+library(shiny)
+library(shinydashboard)
+library(tidyverse)
+library(class)
+library(lubridate) # date manipulation
+library(forecast) # time series library
+library(TTR) # for Simple moving average function
+library(MLmetrics) # calculate error
+library(tseries) # adf.test
+library(fpp) # usconsumtion
+library(TSstudio) # mempercantik visualisasi timeseries
+library(caret)
+```
+
+# Data Preprocess Steps
+
+a. Data Train
+- Import required Data with ***import_csv***
+- Explore data characater with ***glimpse***
+- Check & Treat Missing Values with ***colSums***
+- Data Preparation 
+
+### Import Data
+```{r}
+scotty <- read_csv("data-train.csv")
+scotty_final_test <- read_csv("data-test.csv")
+scotty
+```
+### Check Data Structure & NA Values
+```{r}
+#show the data type that will be use to build the model 
+glimpse(scotty)
+#show the data type that will be use to final test the model 
+glimpse(scotty_final_test)
+
+colSums(is.na(scotty))
+# There is missing values in trip_id, driver_id, & rider_id
+
+```
+### Data Preparation
+```{r}
+#column selection
+scotty <- scotty %>%
+   select(-c(id,trip_id,driver_id,rider_id)) %>% 
+   mutate(src_area = as.factor(src_area),
+          src_sub_area = as.factor(src_sub_area),
+          dest_area = as.factor(dest_area),
+          dest_sub_area = as.factor(dest_sub_area)
+          ) %>%
+   arrange(start_time)
+
+#explore time range of the data
+range(scotty$start_time)
+
+#groupby data set by hour
+scotty <- scotty %>% 
+   mutate(start_time = lubridate::floor_date(start_time, unit = "hour"))%>% 
+   group_by(src_area, status, start_time) %>% 
+   summarise(freq = n()) %>% 
+   ungroup()
+
+library(padr)
+
+# Pad and omit the N value(s) with 0
+scotty <- scotty %>%
+   group_by(src_area, status) %>%
+   pad(start_val = min(scotty$start_time),
+       end_val = max(scotty$start_time)) %>% 
+   ungroup() %>% 
+   mutate(freq = replace_na(data = freq,replace = 0))
+
+## Feature Engineering : Develop new column - Coverage
+
+scotty_clean <- scotty %>% 
+   filter(status == "nodrivers") %>% 
+   mutate(coverage = as.factor(ifelse(freq == 0, "sufficient", "insufficient"))) %>% 
+   select(-status)
+
+scotty_clean
+```
+# Exploratory Data Analysis
+
+```{r}
+## Overall Proportion
+table(scotty$status)
+# by Area Class Proportion
+prop.table(table(scotty$src_area,scotty$status))
+
+library(GGally)
+ggcorr(data = scotty_clean, label = T)
+
+#visualize correlation into y values
+ggplot(scotty_clean)
+
+```
+
+# Model Fitting & Evaluation
+```{r}
+RNGkind(sample.kind = "Rounding")
+set.seed(100)
+
+# train-test splitting
+index <- sample(nrow(scotty_clean), nrow(scotty_clean)*0.8)
+
+# sms.dtm = DocumentTermMatrix yang tidak ada labelnya
+scotty_ctrain <- scotty_clean[index,] 
+scotty_ctest <- scotty_clean[-index,]
+
+glimpse(scotty_clean)
+prop.table(table(scotty_ctrain$coverage))
+```
+
+```{r}
+# build model 1 - Naive Bayes
+library(e1071)
+
+# a. percobaan pada data test pertama
+model_naive <- naiveBayes(x = scotty_ctrain %>% select(-coverage), # kolom-kolom prediktor
+                          y = scotty_ctrain$coverage) # kolom target variable
+
+predict_naive <- predict(object = model_naive,
+                         newdata = scotty_ctest %>% select(-coverage),
+                         type = "class")
+
+confusionMatrix(data = predict_naive, # label prediksi
+                reference = scotty_ctest$coverage, # label actual
+                positive = "insufficient")
+
+# b. percobaan pada data train awal
+predict_naive2 <- predict(object = model_naive,
+                         newdata = scotty_ctrain %>% select(-coverage),
+                         type = "class")
+
+confusionMatrix(data = predict_naive2, # label prediksi
+                reference = scotty_ctrain$coverage, # label actual
+                positive = "insufficient")
+
+# c. pengisian pada data final test
+glimpse(scotty_final_test)
+scotty_final_test$coverage <- predict(object = model_naive,
+                           newdata = scotty_final_test %>% select(-coverage),
+                           type = "class")
+scotty_final_test
+table(scotty_final_test$coverage)
+
+write.csv(scotty_final_test,"scotty_classification.csv", row.names = FALSE)
+
+#result evaluation
+knitr::include_graphics("naive bayes evaluation.png")
+
+```
+
+**since naive bayes model can achieve threshold for specivity parameter, we require to develop other model**
+
+
+# Decision Tree : Model Development & Performance
+
+```{r}
+library(partykit)
+
+scotty_ctrain_dtree <- scotty_ctrain %>% 
+   mutate(month = month(start_time),
+          day = day(start_time),
+          hour = hour(start_time)) %>% 
+   select(-start_time,-freq)
+
+#check
+colnames(scotty_ctrain_dtree)
+
+#build decision tree model
+model_dtree <- ctree(formula = coverage ~ src_area+month+day+hour,
+                     data = scotty_ctrain_dtree,
+                     control = ctree_control(mincriterion=0.5,
+                                             minsplit=0,
+                                             minbucket=100))
+
+#plot(model_dtree, type = "simple")
+
+#feature engineering untuk scotty ctest
+scotty_ctest_dtree <- scotty_ctest %>% 
+   mutate(month = month(start_time),
+          day = day(start_time),
+          hour = hour(start_time)) %>% 
+   select(-start_time,-freq)
+#check
+#scotty_ctest_dtree
+
+
+#build prediction into data test
+predict_dtree <- predict(object = model_dtree,
+                         newdata = scotty_ctest_dtree %>% select(-coverage),
+                         type = "response")
+
+#check dtree model performance
+confusionMatrix(data = predict_dtree, # label prediksi
+                reference = scotty_ctest_dtree$coverage, # label actual
+                positive = "insufficient")
+
+```
+
+```{r}
+# Implement into final data set
+scotty_final_test_dtree <- scotty_final_test %>% 
+   mutate(month = month(datetime),
+          day = day(datetime),
+          hour = hour(datetime)) %>% 
+   select(-datetime)
+
+
+scotty_final_test_dtree$coverage <- predict(object = model_dtree,
+                                      newdata = scotty_final_test_dtree %>% select(-coverage),type = "response")
+
+write.csv(scotty_final_test_dtree,"scotty_classification_dtree.csv", row.names = FALSE)
+```
+
+```{r}
+#result evaluation after uploading into Algoritma's leaderboard
+knitr::include_graphics("dec tree evaluation 2.png")
+```
+
+
+# Variable Model Interpretation
+```{r}
+library(lime)
+
+#set model_dtree as classifier
+classifier_dtree <- as_classifier(x = model_dtree, labels = TRUE)
+
+# Develop explainer
+explainer <- lime(x = scotty_ctrain_dtree %>% select(-coverage), 
+                  model = classifier_dtree)
+
+explanation <- lime::explain(x = scotty_ctest_dtree %>% slice(1:4) %>% select(-coverage),
+                       labels = "insufficient",
+                       dist_fun = "manhattan",
+                       explainer = explainer,
+                       n_permutations = 500,
+                       kernel_width = 3,
+                       n_features = 10,
+                       feature_select = "auto")
+
+plot_features(explanation)
+```
